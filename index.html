@@ -15,7 +15,8 @@
   <meta name="application-name" content="英単語テスト" />
 
   <title>システム英単語テスト</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Tailwind CDN（オフラインキャッシュを安定させるためバージョン固定） -->
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
   <style>
     html, body {
       -webkit-tap-highlight-color: transparent;
@@ -815,6 +816,18 @@
       if (state.screen === "manage")  return renderManage();
       if (state.screen === "quiz")    return renderQuiz();
       if (state.screen === "result")  return renderResult();
+    }
+
+    // =========================================================
+    // Service Worker（オフライン対応）
+    //   2回目以降の起動はキャッシュから即時表示。電波が無くても動作する。
+    // =========================================================
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch((err) => {
+          console.warn("Service Worker 登録に失敗:", err);
+        });
+      });
     }
 
     // 起動
