@@ -64,9 +64,11 @@
     // アプリ状態
     // =========================================================
     const state = {
-      screen: "loading",     // "loading" | "error" | "setup" | "quiz" | "result"
+      screen: "loading",     // "loading" | "error" | "setup" | "manage" | "quiz" | "result"
       errorMessage: "",
-      words: [],             // CSVから読み込んだ単語データ
+      csvWords:  [],         // CSVから読み込んだ単語
+      userWords: [],         // ユーザーがアプリ内で追加した単語（localStorage）
+      words:     [],         // csvWords + userWords（出題に使う統合データ）
       minPage: 1,
       maxPage: 1,
       settings: {
@@ -126,6 +128,78 @@
         console.warn("settings load failed:", e);
         return null;
       }
+    }
+
+    // =========================================================
+    // localStorage（ユーザーが追加した単語）
+    // =========================================================
+    const USER_WORDS_KEY = "system_eitango_user_words_v1";
+
+    function saveUserWords(words) {
+      try {
+        localStorage.setItem(USER_WORDS_KEY, JSON.stringify(words));
+      } catch (e) {
+        console.warn("user words save failed:", e);
+      }
+    }
+
+    function loadUserWords() {
+      try {
+        const raw = localStorage.getItem(USER_WORDS_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return [];
+        return arr.filter((w) =>
+          w && Number.isFinite(w.id) && Number.isFinite(w.page) &&
+          typeof w.word === "string" && typeof w.meaning === "string" &&
+          w.word.length > 0 && w.meaning.length > 0
+        );
+      } catch (e) {
+        console.warn("user words load failed:", e);
+        return [];
+      }
+    }
+
+    // CSV + 追加単語を統合し、最小/最大ページも再計算
+    function refreshCombined() {
+      state.words = [...state.csvWords, ...state.userWords];
+      if (state.words.length > 0) {
+        state.minPage = Math.min(...state.words.map((w) => w.page));
+        state.maxPage = Math.max(...state.words.map((w) => w.page));
+      }
+    }
+
+    // HTMLエスケープ（ユーザー入力を画面表示するときに使用）
+    function escapeHTML(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    // CSVセルエスケープ（カンマ・改行・"" を含むときだけ "..." で囲む）
+    function csvEscape(v) {
+      const s = String(v);
+      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    }
+
+    // 追加単語をCSVファイルとしてダウンロード（バックアップ用）
+    function downloadUserWordsCSV() {
+      const rows = [["id", "word", "meaning", "page"]];
+      state.userWords.forEach((w) => rows.push([w.id, w.word, w.meaning, w.page]));
+      const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
+      const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "my_words.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     }
 
     // =========================================================
@@ -205,11 +279,11 @@
         }
         if (words.length === 0) throw new Error("有効な単語が0件");
 
-        state.words   = words;
-        state.minPage = Math.min(...words.map((w) => w.page));
-        state.maxPage = Math.max(...words.map((w) => w.page));
+        state.csvWords  = words;
+        state.userWords = loadUserWords();
+        refreshCombined();
 
-        // 既定値はCSVの最小〜最大ページ、保存済み設定があれば上書き
+        // 既定値はCSV+追加単語の最小〜最大ページ、保存済み設定があれば上書き
         state.settings.fromPage = state.minPage;
         state.settings.toPage   = state.maxPage;
         const saved = loadSavedSettings();
@@ -328,7 +402,11 @@
               </label>
             </div>
             <p class="text-xs text-slate-400 mt-2">
-              登録範囲：p.${state.minPage} 〜 p.${state.maxPage}（全${state.words.length}語）
+              登録範囲：p.${state.minPage} 〜 p.${state.maxPage}（全${state.words.length}語${
+                state.userWords.length > 0
+                  ? `／うち自分で追加 ${state.userWords.length}語`
+                  : ""
+              }）
             </p>
           </section>
 
@@ -353,6 +431,12 @@
             テスト開始
           </button>
 
+          <button id="manageBtn"
+            class="tap-scale w-full bg-white text-slate-700 text-sm font-semibold
+                   rounded-2xl py-3 border border-slate-200">
+            自分の単語を追加・管理
+          </button>
+
           <p id="setupError" class="text-sm text-rose-500 text-center hidden"></p>
         </main>
       `;
@@ -362,6 +446,11 @@
           state.settings.count = Number(btn.dataset.count);
           renderSetup();
         });
+      });
+
+      app.querySelector("#manageBtn").addEventListener("click", () => {
+        state.screen = "manage";
+        render();
       });
 
       app.querySelector("#startBtn").addEventListener("click", () => {
@@ -399,6 +488,138 @@
     function showError(el, msg) {
       el.textContent = msg;
       el.classList.remove("hidden");
+    }
+
+    // =========================================================
+    // 画面：単語の追加・管理
+    // =========================================================
+    function renderManage() {
+      const sorted = [...state.userWords].sort((a, b) => a.page - b.page);
+
+      app.innerHTML = `
+        <header class="pt-6 pb-3 px-5 flex items-center justify-between">
+          <button id="backToSetupBtn" class="text-sm text-slate-500 tap-scale">← 戻る</button>
+          <h1 class="text-base font-bold text-slate-900">単語の管理</h1>
+          <span class="w-12"></span>
+        </header>
+
+        <main class="flex-1 px-5 pb-8 space-y-5 animate-slide-in">
+
+          <section class="bg-white rounded-2xl shadow-sm p-5">
+            <h2 class="text-sm font-semibold text-slate-700 mb-3">新しい単語を追加</h2>
+            <div class="space-y-3">
+              <div>
+                <label class="block text-xs text-slate-500 mb-1">単語（英語）</label>
+                <input id="newWord" type="text" autocomplete="off" autocapitalize="none" spellcheck="false"
+                  placeholder="例: maintain"
+                  class="w-full text-base rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-slate-500 mb-1">意味（日本語）</label>
+                <input id="newMeaning" type="text"
+                  placeholder="例: 〜を維持する"
+                  class="w-full text-base rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-slate-500 mb-1">ページ番号</label>
+                <input id="newPage" type="number" inputmode="numeric"
+                  placeholder="例: 12"
+                  class="w-full text-base rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+              </div>
+              <button id="addWordBtn"
+                class="tap-scale w-full bg-indigo-600 text-white text-base font-bold
+                       rounded-xl py-3 shadow-md shadow-indigo-200">
+                追加する
+              </button>
+              <p id="addError" class="text-sm text-rose-500 text-center hidden"></p>
+            </div>
+          </section>
+
+          <section class="bg-white rounded-2xl shadow-sm p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-sm font-semibold text-slate-700">追加した単語</h2>
+              <span class="text-xs text-slate-500">${state.userWords.length}語</span>
+            </div>
+            ${state.userWords.length === 0 ? `
+              <p class="text-sm text-slate-400 text-center py-6">
+                まだ追加した単語はありません。<br />
+                学習中に出会った単語を追加してみましょう。
+              </p>
+            ` : `
+              <ul class="divide-y divide-slate-100">
+                ${sorted.map((w) => `
+                  <li class="py-3 flex items-start gap-3">
+                    <span class="inline-flex items-center justify-center min-w-[44px] h-6 rounded-md
+                                 bg-indigo-50 text-indigo-700 text-xs font-semibold px-2 mt-0.5 shrink-0">
+                      p.${w.page}
+                    </span>
+                    <div class="flex-1 min-w-0">
+                      <p class="text-base font-semibold text-slate-900 break-words">${escapeHTML(w.word)}</p>
+                      <p class="text-sm text-slate-600 break-words">${escapeHTML(w.meaning)}</p>
+                    </div>
+                    <button data-delete-id="${w.id}" class="del-btn tap-scale text-sm text-rose-500 px-2 shrink-0">削除</button>
+                  </li>
+                `).join("")}
+              </ul>
+            `}
+          </section>
+
+          ${state.userWords.length > 0 ? `
+            <button id="exportBtn"
+              class="tap-scale w-full bg-white text-slate-700 text-sm font-semibold
+                     rounded-2xl py-3 border border-slate-200">
+              バックアップ用CSVをダウンロード
+            </button>
+            <p class="text-xs text-slate-400 text-center">
+              追加した単語はこのブラウザ内にのみ保存されます。<br />
+              機種変更や削除に備えて、ときどきダウンロードしておくと安心です。
+            </p>
+          ` : ""}
+        </main>
+      `;
+
+      app.querySelector("#backToSetupBtn").addEventListener("click", () => {
+        state.screen = "setup";
+        render();
+      });
+
+      app.querySelector("#addWordBtn").addEventListener("click", () => {
+        const wordEl    = app.querySelector("#newWord");
+        const meaningEl = app.querySelector("#newMeaning");
+        const pageEl    = app.querySelector("#newPage");
+        const err       = app.querySelector("#addError");
+
+        const word    = wordEl.value.trim();
+        const meaning = meaningEl.value.trim();
+        const page    = Number(pageEl.value);
+
+        if (!word)    { showError(err, "単語を入力してください"); return; }
+        if (!meaning) { showError(err, "意味を入力してください"); return; }
+        if (!Number.isFinite(page)) { showError(err, "ページ番号を数値で入力してください"); return; }
+
+        state.userWords.unshift({ id: Date.now(), word, meaning, page });
+        saveUserWords(state.userWords);
+        refreshCombined();
+        renderManage();
+      });
+
+      app.querySelectorAll(".del-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = Number(btn.dataset.deleteId);
+          const target = state.userWords.find((w) => w.id === id);
+          if (!target) return;
+          if (!confirm(`「${target.word}」を削除しますか？`)) return;
+          state.userWords = state.userWords.filter((w) => w.id !== id);
+          saveUserWords(state.userWords);
+          refreshCombined();
+          renderManage();
+        });
+      });
+
+      const exportBtn = app.querySelector("#exportBtn");
+      if (exportBtn) {
+        exportBtn.addEventListener("click", downloadUserWordsCSV);
+      }
     }
 
     // =========================================================
@@ -591,6 +812,7 @@
       if (state.screen === "loading") return renderLoading();
       if (state.screen === "error")   return renderError();
       if (state.screen === "setup")   return renderSetup();
+      if (state.screen === "manage")  return renderManage();
       if (state.screen === "quiz")    return renderQuiz();
       if (state.screen === "result")  return renderResult();
     }
