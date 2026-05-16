@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#4f46e5" />
+
+  <!-- ホーム画面追加時のスタンドアロン表示（iOS Safari） -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="英単語テスト" />
+
+  <!-- ホーム画面追加時のスタンドアロン表示（Android Chrome） -->
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="application-name" content="英単語テスト" />
+
+  <title>システム英単語テスト</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body {
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: contain;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      /* ホーム画面起動時のセーフエリア対応（ノッチ・ホームインジケーター回避） */
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+    }
+    .tap-scale:active {
+      transform: scale(0.97);
+      transition: transform 0.08s;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .animate-slide-in { animation: slideIn 0.25s ease-out; }
+    @keyframes pop {
+      0%   { transform: scale(0.6); opacity: 0; }
+      60%  { transform: scale(1.1); opacity: 1; }
+      100% { transform: scale(1);   opacity: 1; }
+    }
+    .animate-pop { animation: pop 0.35s ease-out; }
+    /* スピナー */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 44px; height: 44px;
+      border: 4px solid #e2e8f0;
+      border-top-color: #6366f1;
+      border-radius: 9999px;
+      animation: spin 0.8s linear infinite;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+
+  <div id="app" class="max-w-md mx-auto min-h-screen flex flex-col"></div>
+
+  <script>
+    // =========================================================
+    // アプリ状態
+    // =========================================================
+    const state = {
+      screen: "loading",     // "loading" | "error" | "setup" | "quiz" | "result"
+      errorMessage: "",
+      words: [],             // CSVから読み込んだ単語データ
+      minPage: 1,
+      maxPage: 1,
+      settings: {
+        fromPage: 1,
+        toPage:   1,
+        count:    10,
+      },
+      quiz: {
+        questions: [],
+        index: 0,
+        correct: 0,
+        selected: null,
+      },
+    };
+
+    const app = document.getElementById("app");
+
+    // =========================================================
+    // ユーティリティ
+    // =========================================================
+    const shuffle = (arr) => {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    };
+
+    const pickRandom = (arr, n) => shuffle(arr).slice(0, n);
+
+    // =========================================================
+    // localStorage（前回のテスト設定を保存／復元）
+    // =========================================================
+    const STORAGE_KEY = "system_eitango_settings_v1";
+
+    function saveSettings(settings) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          fromPage: settings.fromPage,
+          toPage:   settings.toPage,
+          count:    settings.count,
+        }));
+      } catch (e) {
+        console.warn("settings save failed:", e);
+      }
+    }
+
+    function loadSavedSettings() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return null;
+        const obj = JSON.parse(raw);
+        if (!obj || typeof obj !== "object") return null;
+        return obj;
+      } catch (e) {
+        console.warn("settings load failed:", e);
+        return null;
+      }
+    }
+
+    // =========================================================
+    // CSVパース（Vanilla JS・ダブルクォート対応）
+    // =========================================================
+    function parseCSVLine(line) {
+      const cells = [];
+      let cur = "";
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (inQuotes) {
+          if (c === '"') {
+            if (line[i + 1] === '"') { cur += '"'; i++; }   // エスケープ
+            else { inQuotes = false; }
+          } else {
+            cur += c;
+          }
+        } else {
+          if (c === ',') {
+            cells.push(cur);
+            cur = "";
+          } else if (c === '"' && cur === "") {
+            inQuotes = true;
+          } else {
+            cur += c;
+          }
+        }
+      }
+      cells.push(cur);
+      return cells.map((s) => s.trim());
+    }
+
+    function parseCSV(text) {
+      // BOM除去・改行統一・空行除外
+      const cleaned = text.replace(/^﻿/, "");
+      const lines = cleaned.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      if (lines.length < 2) return { header: [], rows: [] };
+      const header = parseCSVLine(lines[0]);
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const values = parseCSVLine(lines[i]);
+        const row = {};
+        header.forEach((h, j) => { row[h] = values[j] ?? ""; });
+        rows.push(row);
+      }
+      return { header, rows };
+    }
+
+    // =========================================================
+    // CSV読み込み
+    // =========================================================
+    async function loadWords() {
+      state.screen = "loading";
+      render();
+      try {
+        const res = await fetch("words.csv", { cache: "no-cache" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+
+        const { header, rows } = parseCSV(text);
+        const required = ["id", "word", "meaning", "page"];
+        const missing = required.filter((h) => !header.includes(h));
+        if (missing.length > 0) {
+          throw new Error(`必要な列が不足: ${missing.join(", ")}`);
+        }
+
+        const words = [];
+        for (const r of rows) {
+          const id   = Number(r.id);
+          const page = Number(r.page);
+          const word = r.word;
+          const meaning = r.meaning;
+          if (!Number.isFinite(id) || !Number.isFinite(page)) continue;
+          if (!word || !meaning) continue;
+          words.push({ id, word, meaning, page });
+        }
+        if (words.length === 0) throw new Error("有効な単語が0件");
+
+        state.words   = words;
+        state.minPage = Math.min(...words.map((w) => w.page));
+        state.maxPage = Math.max(...words.map((w) => w.page));
+
+        // 既定値はCSVの最小〜最大ページ、保存済み設定があれば上書き
+        state.settings.fromPage = state.minPage;
+        state.settings.toPage   = state.maxPage;
+        const saved = loadSavedSettings();
+        if (saved) {
+          if (Number.isFinite(saved.fromPage)) state.settings.fromPage = saved.fromPage;
+          if (Number.isFinite(saved.toPage))   state.settings.toPage   = saved.toPage;
+          if (Number.isFinite(saved.count))    state.settings.count    = saved.count;
+        }
+
+        state.screen  = "setup";
+      } catch (e) {
+        console.error("CSV load failed:", e);
+        state.errorMessage = "単語データの読み込みに失敗しました。ファイルを確認してください";
+        state.screen = "error";
+      }
+      render();
+    }
+
+    // =========================================================
+    // 出題リストの生成
+    //  - 出題対象：指定ページ範囲内の単語からランダムに count 個
+    //  - 誤答（ダミー）：CSV内の「すべての単語の意味」から、正解と重複しないものをランダムに3つ
+    // =========================================================
+    function buildQuestions(settings) {
+      const inRange = state.words.filter(
+        (w) => w.page >= settings.fromPage && w.page <= settings.toPage
+      );
+      if (inRange.length === 0) return [];
+
+      const count = Math.min(settings.count, inRange.length);
+      const targets = pickRandom(inRange, count);
+
+      return targets.map((target) => {
+        // 全単語から、正解と異なる意味を抽出（重複排除）
+        const distractorPool = [
+          ...new Set(
+            state.words
+              .filter((w) => w.meaning !== target.meaning)
+              .map((w) => w.meaning)
+          ),
+        ];
+        const distractors = pickRandom(distractorPool, Math.min(3, distractorPool.length));
+        // 正解＋誤答を Fisher-Yates でシャッフル → indexOf で正解の最終位置を取得
+        // → 正解は A/B/C/D のどこにも一様に並ぶ
+        const choices = shuffle([target.meaning, ...distractors]);
+        return {
+          word: target,
+          choices,
+          answerIndex: choices.indexOf(target.meaning),
+        };
+      });
+    }
+
+    // =========================================================
+    // 画面：ローディング
+    // =========================================================
+    function renderLoading() {
+      app.innerHTML = `
+        <main class="flex-1 flex flex-col items-center justify-center px-5 py-12 animate-slide-in">
+          <div class="spinner"></div>
+          <p class="mt-5 text-slate-600 text-base">単語データを読み込み中...</p>
+        </main>
+      `;
+    }
+
+    // =========================================================
+    // 画面：エラー
+    // =========================================================
+    function renderError() {
+      app.innerHTML = `
+        <main class="flex-1 flex flex-col items-center justify-center px-5 py-12 animate-slide-in">
+          <div class="bg-white rounded-2xl shadow-sm p-6 text-center max-w-sm w-full">
+            <div class="w-12 h-12 rounded-full bg-rose-100 mx-auto flex items-center justify-center">
+              <span class="text-rose-500 text-2xl font-bold">!</span>
+            </div>
+            <p class="mt-4 text-base font-semibold text-slate-800">読み込みエラー</p>
+            <p class="mt-2 text-sm text-slate-600">${state.errorMessage}</p>
+            <button id="retryLoadBtn"
+              class="tap-scale mt-6 w-full bg-indigo-600 text-white text-base font-bold
+                     rounded-2xl py-3 shadow-md shadow-indigo-200">
+              再読み込み
+            </button>
+          </div>
+        </main>
+      `;
+      app.querySelector("#retryLoadBtn").addEventListener("click", loadWords);
+    }
+
+    // =========================================================
+    // 画面：設定（トップ）
+    // =========================================================
+    function renderSetup() {
+      const s = state.settings;
+      app.innerHTML = `
+        <header class="pt-8 pb-4 px-5">
+          <h1 class="text-2xl font-bold text-slate-900">システム英単語</h1>
+          <p class="text-sm text-slate-500 mt-1">通学中のスキマ時間に1問ずつ</p>
+        </header>
+
+        <main class="flex-1 px-5 pb-8 space-y-5 animate-slide-in">
+          <section class="bg-white rounded-2xl shadow-sm p-5">
+            <h2 class="text-sm font-semibold text-slate-700 mb-3">出題範囲（ページ）</h2>
+            <div class="flex items-center gap-3">
+              <label class="flex-1">
+                <span class="block text-xs text-slate-500 mb-1">開始</span>
+                <input id="fromPage" type="number" inputmode="numeric"
+                  min="${state.minPage}" max="${state.maxPage}" value="${s.fromPage}"
+                  class="w-full text-lg font-semibold rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+              </label>
+              <span class="text-slate-400 mt-5">〜</span>
+              <label class="flex-1">
+                <span class="block text-xs text-slate-500 mb-1">終了</span>
+                <input id="toPage" type="number" inputmode="numeric"
+                  min="${state.minPage}" max="${state.maxPage}" value="${s.toPage}"
+                  class="w-full text-lg font-semibold rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+              </label>
+            </div>
+            <p class="text-xs text-slate-400 mt-2">
+              登録範囲：p.${state.minPage} 〜 p.${state.maxPage}（全${state.words.length}語）
+            </p>
+          </section>
+
+          <section class="bg-white rounded-2xl shadow-sm p-5">
+            <h2 class="text-sm font-semibold text-slate-700 mb-3">問題数</h2>
+            <div class="grid grid-cols-3 gap-2">
+              ${[5, 10, 20].map(n => `
+                <button data-count="${n}"
+                  class="count-btn tap-scale rounded-xl py-3 text-base font-semibold border transition-colors
+                    ${s.count === n
+                      ? 'bg-indigo-600 text-white border-indigo-600'
+                      : 'bg-white text-slate-700 border-slate-200'}">
+                  ${n}問
+                </button>
+              `).join("")}
+            </div>
+          </section>
+
+          <button id="startBtn"
+            class="tap-scale w-full bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800
+                   text-white text-lg font-bold rounded-2xl py-4 shadow-md shadow-indigo-200">
+            テスト開始
+          </button>
+
+          <p id="setupError" class="text-sm text-rose-500 text-center hidden"></p>
+        </main>
+      `;
+
+      app.querySelectorAll(".count-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.settings.count = Number(btn.dataset.count);
+          renderSetup();
+        });
+      });
+
+      app.querySelector("#startBtn").addEventListener("click", () => {
+        const from = Number(app.querySelector("#fromPage").value);
+        const to   = Number(app.querySelector("#toPage").value);
+        const err  = app.querySelector("#setupError");
+
+        if (!Number.isFinite(from) || !Number.isFinite(to)) {
+          showError(err, "ページを数値で入力してください");
+          return;
+        }
+        if (from > to) {
+          showError(err, "開始ページは終了ページ以下にしてください");
+          return;
+        }
+
+        state.settings.fromPage = from;
+        state.settings.toPage   = to;
+
+        const questions = buildQuestions(state.settings);
+        if (questions.length === 0) {
+          showError(err, "指定範囲に単語がありません");
+          return;
+        }
+
+        // 次回起動時に入力欄を復元できるよう設定を保存
+        saveSettings(state.settings);
+
+        state.quiz = { questions, index: 0, correct: 0, selected: null };
+        state.screen = "quiz";
+        render();
+      });
+    }
+
+    function showError(el, msg) {
+      el.textContent = msg;
+      el.classList.remove("hidden");
+    }
+
+    // =========================================================
+    // 画面：クイズ
+    // =========================================================
+    function renderQuiz() {
+      const { questions, index, selected } = state.quiz;
+      const q = questions[index];
+      const total = questions.length;
+      const progressPct = Math.round((index / total) * 100);
+      const answered = selected !== null;
+      const isCorrect = answered && selected === q.answerIndex;
+
+      app.innerHTML = `
+        <header class="pt-6 pb-3 px-5">
+          <div class="flex items-center justify-between mb-2">
+            <button id="backBtn" class="text-sm text-slate-500 tap-scale">← やめる</button>
+            <span class="text-sm font-semibold text-slate-600">
+              ${index + 1} / ${total} 問目
+            </span>
+          </div>
+          <div class="h-2 bg-slate-200 rounded-full overflow-hidden">
+            <div class="h-full bg-indigo-500 transition-all duration-300"
+                 style="width: ${progressPct}%"></div>
+          </div>
+        </header>
+
+        <main class="flex-1 px-5 pb-8 flex flex-col animate-slide-in">
+          <div class="bg-white rounded-2xl shadow-sm py-10 px-5 text-center mt-2">
+            <p class="text-xs text-slate-400 mb-2">p.${q.word.page}</p>
+            <p class="text-4xl font-bold text-slate-900 break-words">${q.word.word}</p>
+            <p class="text-xs text-slate-400 mt-3">意味として正しいものを選んでください</p>
+          </div>
+
+          <div class="mt-5 space-y-3">
+            ${q.choices.map((choice, i) => {
+              let cls = "bg-white border-slate-200 text-slate-800";
+              let badge = "";
+              if (answered) {
+                if (i === q.answerIndex) {
+                  cls = "bg-emerald-50 border-emerald-400 text-emerald-800";
+                  badge = `<span class="text-emerald-500 font-bold">◯</span>`;
+                } else if (i === selected) {
+                  cls = "bg-rose-50 border-rose-400 text-rose-800";
+                  badge = `<span class="text-rose-500 font-bold">×</span>`;
+                } else {
+                  cls = "bg-white border-slate-200 text-slate-400";
+                }
+              }
+              return `
+                <button data-choice="${i}" ${answered ? "disabled" : ""}
+                  class="choice-btn tap-scale w-full text-left rounded-2xl border-2 px-4 py-4
+                         flex items-center justify-between gap-3 transition-colors ${cls}">
+                  <span class="flex items-center gap-3">
+                    <span class="inline-flex items-center justify-center w-7 h-7 rounded-full
+                                 bg-slate-100 text-slate-600 text-sm font-semibold">
+                      ${"ABCD"[i]}
+                    </span>
+                    <span class="text-base">${choice}</span>
+                  </span>
+                  ${badge}
+                </button>
+              `;
+            }).join("")}
+          </div>
+
+          ${answered ? `
+            <div class="mt-6 text-center animate-pop">
+              <p class="text-2xl font-bold ${isCorrect ? 'text-emerald-600' : 'text-rose-600'}">
+                ${isCorrect ? "◯ 正解！" : "× 不正解"}
+              </p>
+              ${!isCorrect ? `
+                <p class="text-sm text-slate-500 mt-1">
+                  正解：<span class="font-semibold text-slate-700">${q.choices[q.answerIndex]}</span>
+                </p>
+              ` : ""}
+            </div>
+            <button id="nextBtn"
+              class="tap-scale mt-5 w-full bg-indigo-600 text-white text-lg font-bold
+                     rounded-2xl py-4 shadow-md shadow-indigo-200">
+              ${index + 1 === total ? "結果を見る" : "次の問題へ →"}
+            </button>
+          ` : ""}
+        </main>
+      `;
+
+      app.querySelector("#backBtn").addEventListener("click", () => {
+        if (confirm("テストを中断してトップに戻ります。よろしいですか？")) {
+          state.screen = "setup";
+          render();
+        }
+      });
+
+      app.querySelectorAll(".choice-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const i = Number(btn.dataset.choice);
+          state.quiz.selected = i;
+          if (i === q.answerIndex) state.quiz.correct += 1;
+          render();
+        });
+      });
+
+      const nextBtn = app.querySelector("#nextBtn");
+      if (nextBtn) {
+        nextBtn.addEventListener("click", () => {
+          if (index + 1 === total) {
+            state.screen = "result";
+          } else {
+            state.quiz.index += 1;
+            state.quiz.selected = null;
+          }
+          render();
+        });
+      }
+    }
+
+    // =========================================================
+    // 画面：結果
+    // =========================================================
+    function renderResult() {
+      const total = state.quiz.questions.length;
+      const correct = state.quiz.correct;
+      const rate = Math.round((correct / total) * 100);
+      const message =
+        rate === 100 ? "パーフェクト！🎉" :
+        rate >= 80   ? "すごい！その調子！" :
+        rate >= 60   ? "もう少し！復習しよう" :
+                       "次はがんばろう💪";
+
+      app.innerHTML = `
+        <header class="pt-8 pb-4 px-5 text-center">
+          <h1 class="text-2xl font-bold text-slate-900">テスト結果</h1>
+        </header>
+
+        <main class="flex-1 px-5 pb-8 animate-slide-in">
+          <section class="bg-white rounded-2xl shadow-sm p-6 text-center">
+            <p class="text-sm text-slate-500">正解数</p>
+            <p class="mt-1">
+              <span class="text-5xl font-extrabold text-indigo-600">${correct}</span>
+              <span class="text-2xl text-slate-400"> / ${total}</span>
+            </p>
+
+            <div class="mt-5">
+              <p class="text-sm text-slate-500">正解率</p>
+              <p class="text-3xl font-bold text-slate-900 mt-1">${rate}%</p>
+              <div class="mt-3 h-3 bg-slate-200 rounded-full overflow-hidden">
+                <div class="h-full bg-indigo-500 transition-all duration-700"
+                     style="width: ${rate}%"></div>
+              </div>
+            </div>
+
+            <p class="mt-5 text-base font-semibold text-slate-700">${message}</p>
+            <p class="mt-2 text-xs text-slate-400">
+              範囲：p.${state.settings.fromPage} 〜 p.${state.settings.toPage}
+            </p>
+          </section>
+
+          <div class="mt-6 space-y-3">
+            <button id="retryBtn"
+              class="tap-scale w-full bg-indigo-600 text-white text-lg font-bold
+                     rounded-2xl py-4 shadow-md shadow-indigo-200">
+              もう一度テストする（同じ範囲）
+            </button>
+            <button id="homeBtn"
+              class="tap-scale w-full bg-white text-slate-700 text-base font-semibold
+                     rounded-2xl py-4 border border-slate-200">
+              トップに戻る
+            </button>
+          </div>
+        </main>
+      `;
+
+      app.querySelector("#retryBtn").addEventListener("click", () => {
+        const questions = buildQuestions(state.settings);
+        state.quiz = { questions, index: 0, correct: 0, selected: null };
+        state.screen = "quiz";
+        render();
+      });
+
+      app.querySelector("#homeBtn").addEventListener("click", () => {
+        state.screen = "setup";
+        render();
+      });
+    }
+
+    // =========================================================
+    // ルーティング
+    // =========================================================
+    function render() {
+      if (state.screen === "loading") return renderLoading();
+      if (state.screen === "error")   return renderError();
+      if (state.screen === "setup")   return renderSetup();
+      if (state.screen === "quiz")    return renderQuiz();
+      if (state.screen === "result")  return renderResult();
+    }
+
+    // 起動
+    loadWords();
+  </script>
+</body>
+</html>
